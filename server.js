@@ -77,19 +77,20 @@ async function handleStart(res, params) {
   
   console.log(`[Worker] Starting new session ${sessionId} for URL: ${url}`);
   
-  const browser = await puppeteer.launch({
-    headless: 'new',
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--no-first-run',
-      '--no-zygote',
-      '--single-process',
-      '--disable-extensions'
-    ],
-  });
+const browser = await puppeteer.launch({
+  headless: 'new',
+  executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+  args: [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-gpu',
+    '--no-first-run',
+    '--no-zygote',
+    '--single-process',
+    '--disable-extensions'
+  ],
+});
 
   const page = await browser.newPage();
   await page.setViewport({ width: 1280, height: 800 });
@@ -625,3 +626,4 @@ app.listen(PORT, () => {
   console.log(`[Worker] Puppeteer automation worker listening on port ${PORT}`);
   console.log(`[Worker] Callback URL: ${CALLBACK_URL}`);
 });
+
