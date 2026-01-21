@@ -497,7 +497,9 @@ async function sendCallback(callbackUrl, data) {
 
 app.post('/scrape', async (req, res) => {
   const { url, secret, username, password } = req.body;
-  console.log(`[Worker] Scrape request: ${url}`);
+  console.log(`[Worker] ========== SCRAPE REQUEST ==========`);
+  console.log(`[Worker] URL: ${url}`);
+  console.log(`[Worker] Credentials provided: ${!!(username && password)}`);
 
   if (WORKER_SECRET && secret !== WORKER_SECRET) {
     return res.status(401).json({ success: false, error: 'Invalid secret' });
@@ -516,31 +518,90 @@ app.post('/scrape', async (req, res) => {
 
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 800 });
-    await applyRelyhomeCookieCache(page);
+    
+    const hasCookies = hasFreshCookieCache();
+    console.log(`[Worker] Has fresh cookie cache: ${hasCookies}`);
+    
+    if (hasCookies) {
+      await applyRelyhomeCookieCache(page);
+    }
 
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 20000 });
-    await delay(2000);
+    // If no fresh cookies and credentials provided, login first
+    const u = username || RELYHOME_USERNAME;
+    const p = password || RELYHOME_PASSWORD;
+    
+    if (!hasCookies && u && p) {
+      console.log('[Worker] No cached cookies, logging in first...');
+      await loginToRelyHome(page, u, p);
+      await saveRelyhomeCookieCache(page);
+      console.log('[Worker] Login complete, now navigating to jobs page');
+    }
+
+    // Navigate to the jobs page
+    console.log(`[Worker] Navigating to: ${url}`);
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+    await delay(3000);
 
     let { markdown, jobLinks } = await extractJobData(page);
     let html = await page.content();
+    
+    console.log(`[Worker] Initial content length: ${markdown.length}, links: ${jobLinks.length}`);
 
+    // Check if still showing session expired (cookies might be stale)
     if (looksLikeRelyhomeSessionExpired(markdown)) {
-      console.log('[Worker] Session expired during scrape; logging in...');
-      const u = username || RELYHOME_USERNAME;
-      const p = password || RELYHOME_PASSWORD;
-      if (!u || !p) throw new Error('Session expired and no credentials');
+      console.log('[Worker] Session appears expired, attempting login...');
+      
+      if (!u || !p) {
+        console.log('[Worker] No credentials available for re-login');
+        throw new Error('Session expired and no credentials provided');
+      }
 
+      // Clear stale cookies and login fresh
+      relyhomeCookies = null;
+      relyhomeCookiesUpdatedAt = 0;
+      
       await loginToRelyHome(page, u, p);
       await saveRelyhomeCookieCache(page);
 
-      await page.goto(url, { waitUntil: 'networkidle2', timeout: 20000 });
-      await delay(2000);
+      // After login, navigate directly to available jobs
+      const jobsUrl = 'https://relyhome.com/jobs/accept/available-swo.php';
+      console.log(`[Worker] Post-login navigation to: ${jobsUrl}`);
+      await page.goto(jobsUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+      await delay(3000);
 
       ({ markdown, jobLinks } = await extractJobData(page));
       html = await page.content();
+      
+      console.log(`[Worker] Post-login content length: ${markdown.length}, links: ${jobLinks.length}`);
+      
+      // If still expired after fresh login, the URL might be wrong
+      if (looksLikeRelyhomeSessionExpired(markdown)) {
+        // Try to find correct jobs page from current page
+        const foundJobsUrl = await page.evaluate(() => {
+          const links = Array.from(document.querySelectorAll('a'));
+          for (const link of links) {
+            const text = (link.textContent || '').toLowerCase();
+            const href = link.href || '';
+            if (text.includes('available') || href.includes('available')) {
+              return href;
+            }
+          }
+          return null;
+        });
+        
+        if (foundJobsUrl && foundJobsUrl !== jobsUrl) {
+          console.log(`[Worker] Found alternative jobs URL: ${foundJobsUrl}`);
+          await page.goto(foundJobsUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+          await delay(3000);
+          ({ markdown, jobLinks } = await extractJobData(page));
+          html = await page.content();
+          console.log(`[Worker] Alternative URL content: ${markdown.length} chars, ${jobLinks.length} links`);
+        }
+      }
     }
 
-    console.log(`[Worker] Scraped ${markdown.length} chars, ${jobLinks.length} links`);
+    console.log(`[Worker] ========== SCRAPE RESULT ==========`);
+    console.log(`[Worker] Final content: ${markdown.length} chars, ${jobLinks.length} job links`);
 
     res.json({
       success: true,
