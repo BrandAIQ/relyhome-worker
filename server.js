@@ -1,5 +1,5 @@
 /**
- * RelyHome Puppeteer Automation Worker (FULLY FIXED)
+ * RelyHome Puppeteer Automation Worker (FULLY FIXED - Enhanced Token Discovery)
  */
 
 const express = require('express');
@@ -25,7 +25,6 @@ const RELYHOME_SESSION_EXPIRED_PATTERNS = [
   'authentication required',
 ];
 
-// Helper for delays (replaces deprecated waitForTimeout)
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -64,19 +63,15 @@ async function saveRelyhomeCookieCache(page) {
       relyhomeCookiesUpdatedAt = Date.now();
       console.log(`[Worker] Cached RelyHome cookies (${cookies.length})`);
     }
-  } catch (e) {
-    // non-fatal
-  }
+  } catch (e) {}
 }
 
-// FIXED: Robust login with better detection
 async function loginToRelyHome(page, username, password) {
   console.log('[Worker] Logging into RelyHome...');
   
   await page.goto('https://relyhome.com/login', { waitUntil: 'networkidle2', timeout: 30000 });
   await delay(2000);
 
-  // Wait for any login form field
   await page.waitForSelector(
     'input[name="username"], input[name="email"], input[type="email"], input[type="text"], #username, #email',
     { timeout: 15000 }
@@ -119,21 +114,17 @@ async function loginToRelyHome(page, username, password) {
     throw new Error('Could not find login form fields');
   }
 
-  // Clear and type username
   await usernameField.click({ clickCount: 3 });
   await delay(100);
   await page.keyboard.press('Backspace');
   await usernameField.type(username, { delay: 30 });
   
-  // Clear and type password
   await passwordField.click({ clickCount: 3 });
   await delay(100);
   await page.keyboard.press('Backspace');
   await passwordField.type(password, { delay: 30 });
-
   await delay(500);
 
-  // Try to find and click submit button
   const didSubmit = await page.evaluate(() => {
     const submitSelectors = [
       'button[type="submit"]',
@@ -152,7 +143,6 @@ async function loginToRelyHome(page, username, password) {
       }
     }
 
-    // Fallback: find any button with login-related text
     const allButtons = [...document.querySelectorAll('button, input[type="submit"]')];
     for (const btn of allButtons) {
       const text = (btn.value || btn.textContent || btn.innerText || '').toLowerCase();
@@ -161,7 +151,6 @@ async function loginToRelyHome(page, username, password) {
         return { clicked: true, text };
       }
     }
-
     return { clicked: false };
   });
 
@@ -172,7 +161,6 @@ async function loginToRelyHome(page, username, password) {
     await page.keyboard.press('Enter');
   }
 
-  // Wait for navigation or page change
   console.log('[Worker] Waiting for post-login navigation...');
   
   await Promise.race([
@@ -180,7 +168,6 @@ async function loginToRelyHome(page, username, password) {
     delay(15000),
   ]);
 
-  // Extra buffer for client-side redirects
   await delay(3000);
 
   const finalUrl = page.url();
@@ -189,9 +176,7 @@ async function loginToRelyHome(page, username, password) {
 
   console.log(`[Worker] Post-login URL: ${finalUrl}`);
   console.log(`[Worker] Page text length: ${pageText.length}`);
-  console.log(`[Worker] Page text preview: ${pageText.substring(0, 300)}`);
 
-  // Check for explicit error messages ONLY
   const errorMessages = [
     'invalid password',
     'invalid credentials',
@@ -209,11 +194,10 @@ async function loginToRelyHome(page, username, password) {
   const hasLoginError = errorMessages.some(msg => lowerText.includes(msg));
 
   if (hasLoginError) {
-    console.log('[Worker] Explicit login error detected in page text');
+    console.log('[Worker] Explicit login error detected');
     throw new Error('Login failed: Invalid credentials');
   }
 
-  // Success indicators - if ANY of these are true, login succeeded
   const successIndicators = [
     !finalUrl.includes('/login'),
     finalUrl.includes('dashboard'),
@@ -237,45 +221,15 @@ async function loginToRelyHome(page, username, password) {
     return;
   }
 
-  // Only fail if password field is STILL visible AND we're on login URL
   const passwordStillVisible = await page.$('input[type="password"]');
   const stillOnLoginUrl = finalUrl.includes('/login');
 
   if (stillOnLoginUrl && passwordStillVisible) {
-    // Take screenshot for debugging
-    try {
-      const screenshot = await page.screenshot({ encoding: 'base64' });
-      console.log(`[Worker] Debug screenshot (base64, first 100 chars): ${screenshot.substring(0, 100)}...`);
-    } catch (e) {}
-    
     console.log('[Worker] Still on login page with password field visible');
     throw new Error('Login appears to have failed - still on login page');
   }
 
-  // If we got here, assume success (page changed enough)
-  console.log('[Worker] Login appears successful (no failure indicators found)');
-}
-
-async function ensureRelyhomeSession(page, { username, password, contextLabel }) {
-  const label = contextLabel ? ` (${contextLabel})` : '';
-  await applyRelyhomeCookieCache(page);
-
-  try {
-    const text = await page.evaluate(() => document.body?.innerText || '');
-    if (!looksLikeRelyhomeSessionExpired(text)) return;
-
-    if (!username || !password) {
-      throw new Error(
-        `Session appears expired${label} but no credentials provided.`
-      );
-    }
-
-    console.log(`[Worker] Session appears expired${label}; attempting login...`);
-    await loginToRelyHome(page, username, password);
-    await saveRelyhomeCookieCache(page);
-  } catch (e) {
-    // If page isn't ready, ignore
-  }
+  console.log('[Worker] Login appears successful');
 }
 
 // Health check
@@ -285,15 +239,7 @@ app.get('/health', (req, res) => {
 
 // Accept job endpoint
 app.post('/accept', async (req, res) => {
-  const {
-    job_id,
-    task_id,
-    accept_url,
-    preferred_slots,
-    preferred_days,
-    callback_url,
-    secret,
-  } = req.body;
+  const { job_id, task_id, accept_url, preferred_slots, preferred_days, callback_url, secret } = req.body;
 
   console.log(`[Worker] Received job ${job_id}, task ${task_id}`);
   console.log(`[Worker] Accept URL: ${accept_url}`);
@@ -315,15 +261,7 @@ app.post('/accept', async (req, res) => {
   }).catch((e) => console.error('[Worker] processJob error:', e));
 });
 
-async function processJob({
-  job_id,
-  task_id,
-  accept_url,
-  preferred_slots,
-  preferred_days,
-  callback_url,
-  secret,
-}) {
+async function processJob({ job_id, task_id, accept_url, preferred_slots, preferred_days, callback_url, secret }) {
   let browser = null;
   let screenshotBase64 = null;
   let availableSlots = [];
@@ -432,18 +370,15 @@ async function processJob({
     const { date, day, timeRange } = parseSlotLabel(bestSlot.label);
 
     await sendCallback(callback_url, {
-      job_id,
-      task_id,
-      success: true,
+      job_id, task_id, success: true,
       selected_slot: timeRange || bestSlot.value,
-      selected_date: date,
-      selected_day: day,
+      selected_date: date, selected_day: day,
       confirmation_message: isConfirmed ? 'Job accepted' : 'Submitted',
       screenshot_base64: screenshotBase64,
       available_slots: availableSlots.map((s) => s.label),
-      error: null,
-      secret,
+      error: null, secret,
     });
+
   } catch (error) {
     console.error(`[Worker] Error:`, error.message);
     if (browser) {
@@ -453,17 +388,11 @@ async function processJob({
       } catch (e) {}
     }
     await sendCallback(callback_url, {
-      job_id,
-      task_id,
-      success: false,
-      selected_slot: null,
-      selected_date: null,
-      selected_day: null,
-      confirmation_message: null,
-      screenshot_base64: screenshotBase64,
+      job_id, task_id, success: false,
+      selected_slot: null, selected_date: null, selected_day: null,
+      confirmation_message: null, screenshot_base64: screenshotBase64,
       available_slots: availableSlots.map((s) => s.label),
-      error: error.message,
-      secret,
+      error: error.message, secret,
     });
   } finally {
     if (browser) await browser.close();
@@ -473,7 +402,6 @@ async function processJob({
 function findBestSlot(availableSlots, preferredDays, preferredSlots) {
   const normDays = (preferredDays || []).map((d) => String(d).toLowerCase());
   const normSlots = (preferredSlots || []).map((s) => String(s).toLowerCase());
-
   const scoredSlots = availableSlots.map((slot) => {
     let score = 0;
     const labelLower = String(slot.label || '').toLowerCase();
@@ -492,7 +420,6 @@ function findBestSlot(availableSlots, preferredDays, preferredSlots) {
     }
     return { ...slot, score };
   });
-
   scoredSlots.sort((a, b) => b.score - a.score);
   return scoredSlots[0];
 }
@@ -569,7 +496,6 @@ app.post('/scrape', async (req, res) => {
       const u = username || RELYHOME_USERNAME;
       const p = password || RELYHOME_PASSWORD;
       if (!u || !p) throw new Error('Session expired and no credentials');
-
       await loginToRelyHome(page, u, p);
       await saveRelyhomeCookieCache(page);
       await page.goto(url, { waitUntil: 'networkidle2', timeout: 20000 });
@@ -587,6 +513,7 @@ app.post('/scrape', async (req, res) => {
       job_links: jobLinks,
       scraped_at: new Date().toISOString(),
     });
+
   } catch (error) {
     console.error(`[Worker] Scrape error:`, error.message);
     res.status(500).json({ success: false, error: error.message });
@@ -602,12 +529,7 @@ async function extractJobData(page) {
     const acceptLinks = document.querySelectorAll('a[href*="/jobs/accept/offer.php"], a[href*="offer.php"]');
     acceptLinks.forEach((link, index) => {
       const row = link.closest('tr');
-      links.push({
-        href: link.href,
-        text: link.innerText || '',
-        rowText: row ? row.innerText : '',
-        index,
-      });
+      links.push({ href: link.href, text: link.innerText || '', rowText: row ? row.innerText : '', index });
     });
     if (links.length === 0) {
       document.querySelectorAll('a').forEach((link, index) => {
@@ -623,7 +545,7 @@ async function extractJobData(page) {
   });
 }
 
-// Login endpoint
+// ENHANCED Login endpoint with better token discovery
 app.post('/login', async (req, res) => {
   const { username, password, secret } = req.body;
   console.log(`[Worker] Login request for: ${username}`);
@@ -647,81 +569,218 @@ app.post('/login', async (req, res) => {
 
     await loginToRelyHome(page, username, password);
     await saveRelyhomeCookieCache(page);
-    await delay(2000);
 
-    console.log(`[Worker] Post-login URL: ${page.url()}`);
-
-    // Find Available Jobs link
-    const navResult = await page.evaluate(() => {
-      const allLinks = Array.from(document.querySelectorAll('a'));
-      for (const link of allLinks) {
-        const href = link.getAttribute('href') || '';
-        const text = (link.textContent || '').toLowerCase();
-        if ((href.includes('available-swo') || href.includes('available') || text.includes('available')) &&
-            href.includes('vid=') && href.includes('exp=')) {
-          return { found: true, url: new URL(href, window.location.origin).href, method: 'tokenized' };
-        }
-      }
-      for (const link of allLinks) {
-        const href = link.getAttribute('href') || '';
-        const text = (link.textContent || '').toLowerCase();
-        if (href.includes('available-swo') || (text.includes('available') && text.includes('job'))) {
-          link.click();
-          return { found: true, clicked: true, method: 'clicked' };
-        }
-      }
-      return { found: false };
-    });
-
-    console.log(`[Worker] Nav result:`, JSON.stringify(navResult));
+    // Wait for dashboard to fully load
+    await delay(3000);
+    
+    let currentUrl = page.url();
+    console.log(`[Worker] Post-login URL: ${currentUrl}`);
+    
+    // Log the full HTML to help debug
+    const postLoginHtml = await page.content();
+    console.log(`[Worker] Post-login HTML length: ${postLoginHtml.length}`);
+    console.log(`[Worker] HTML contains vid=: ${postLoginHtml.includes('vid=')}`);
+    console.log(`[Worker] HTML contains exp=: ${postLoginHtml.includes('exp=')}`);
 
     let portalUrl = null;
 
-    if (navResult.found && navResult.url) {
-      portalUrl = navResult.url;
-    } else if (navResult.clicked) {
-      await Promise.race([
-        page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {}),
-        delay(6000),
-      ]);
-      await delay(1500);
-      portalUrl = page.url();
+    // Strategy 1: Look for tokenized link in current page
+    console.log('[Worker] Strategy 1: Looking for tokenized links in page...');
+    const tokenizedFromPage = await page.evaluate(() => {
+      const allLinks = Array.from(document.querySelectorAll('a'));
+      for (const link of allLinks) {
+        const href = link.getAttribute('href') || '';
+        if (href.includes('vid=') && href.includes('exp=')) {
+          return { url: new URL(href, window.location.origin).href, source: 'link', text: link.textContent };
+        }
+      }
+      return null;
+    });
+
+    if (tokenizedFromPage) {
+      console.log(`[Worker] Found tokenized URL from link: ${tokenizedFromPage.url}`);
+      portalUrl = tokenizedFromPage.url;
     }
 
-    if (!portalUrl || !portalUrl.includes('vid=') || !portalUrl.includes('exp=')) {
+    // Strategy 2: Click on "Available" or similar navigation link
+    if (!portalUrl || !portalUrl.includes('vid=')) {
+      console.log('[Worker] Strategy 2: Clicking navigation to Available Jobs...');
+      
+      const clickResult = await page.evaluate(() => {
+        const allLinks = Array.from(document.querySelectorAll('a'));
+        for (const link of allLinks) {
+          const text = (link.textContent || '').toLowerCase();
+          const href = link.getAttribute('href') || '';
+          // Look for "Available" link that's NOT the current page
+          if ((text.includes('available') || href.includes('available')) && 
+              !href.includes('vid=') && 
+              href.length > 0) {
+            console.log('Clicking:', text, href);
+            link.click();
+            return { clicked: true, text: link.textContent, href };
+          }
+        }
+        return { clicked: false };
+      });
+
+      console.log(`[Worker] Click result:`, JSON.stringify(clickResult));
+
+      if (clickResult.clicked) {
+        // Wait for navigation
+        await Promise.race([
+          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {}),
+          delay(8000),
+        ]);
+        await delay(2000);
+        
+        currentUrl = page.url();
+        console.log(`[Worker] URL after clicking nav: ${currentUrl}`);
+        
+        if (currentUrl.includes('vid=') && currentUrl.includes('exp=')) {
+          portalUrl = currentUrl;
+          console.log(`[Worker] Got tokenized URL from navigation: ${portalUrl}`);
+        }
+      }
+    }
+
+    // Strategy 3: Direct navigation to available-swo.php
+    if (!portalUrl || !portalUrl.includes('vid=')) {
+      console.log('[Worker] Strategy 3: Direct navigation to available-swo.php...');
+      
       await page.goto('https://relyhome.com/jobs/accept/available-swo.php', {
         waitUntil: 'networkidle2',
         timeout: 20000,
       });
-      await delay(2000);
-      portalUrl = page.url();
+      await delay(3000);
+      
+      currentUrl = page.url();
+      console.log(`[Worker] URL after direct navigation: ${currentUrl}`);
+      
+      if (currentUrl.includes('vid=') && currentUrl.includes('exp=')) {
+        portalUrl = currentUrl;
+      }
     }
 
-    if (!portalUrl.includes('vid=') || !portalUrl.includes('exp=')) {
-      const tokenizedUrl = await page.evaluate(() => {
-        for (const link of document.querySelectorAll('a')) {
-          const href = link.getAttribute('href') || '';
-          if (href.includes('vid=') && href.includes('exp=')) {
-            return new URL(href, window.location.origin).href;
+    // Strategy 4: Search current page HTML for tokenized URLs
+    if (!portalUrl || !portalUrl.includes('vid=')) {
+      console.log('[Worker] Strategy 4: Searching HTML source for tokens...');
+      
+      const htmlContent = await page.content();
+      
+      // Look for full URLs with tokens
+      const urlPatterns = [
+        /https?:\/\/[^\s"'<>]*available-swo\.php\?[^\s"'<>]*vid=[^\s"'<>]*/gi,
+        /available-swo\.php\?[^\s"'<>]*vid=[^\s"'<>]*/gi,
+        /href="([^"]*vid=[^"]*exp=[^"]*)"/gi,
+        /href='([^']*vid=[^']*exp=[^']*)'/gi,
+      ];
+
+      for (const pattern of urlPatterns) {
+        const matches = htmlContent.match(pattern);
+        if (matches && matches.length > 0) {
+          let match = matches[0];
+          // Clean up the match
+          match = match.replace(/^href=["']/, '').replace(/["']$/, '');
+          if (!match.startsWith('http')) {
+            match = new URL(match, 'https://relyhome.com').href;
+          }
+          console.log(`[Worker] Found token URL in HTML: ${match}`);
+          portalUrl = match;
+          break;
+        }
+      }
+    }
+
+    // Strategy 5: Look in iframes, forms, meta tags, scripts
+    if (!portalUrl || !portalUrl.includes('vid=')) {
+      console.log('[Worker] Strategy 5: Deep search in page elements...');
+      
+      const deepSearch = await page.evaluate(() => {
+        // Check iframes
+        const iframes = Array.from(document.querySelectorAll('iframe'));
+        for (const iframe of iframes) {
+          const src = iframe.getAttribute('src') || '';
+          if (src.includes('vid=') && src.includes('exp=')) {
+            return { url: src, source: 'iframe' };
           }
         }
+
+        // Check forms
+        const forms = Array.from(document.querySelectorAll('form'));
+        for (const form of forms) {
+          const action = form.getAttribute('action') || '';
+          if (action.includes('vid=') && action.includes('exp=')) {
+            return { url: action, source: 'form' };
+          }
+        }
+
+        // Check meta refresh
+        const metaRefresh = document.querySelector('meta[http-equiv="refresh"]');
+        if (metaRefresh) {
+          const content = metaRefresh.getAttribute('content') || '';
+          const urlMatch = content.match(/url=([^;]+)/i);
+          if (urlMatch && urlMatch[1].includes('vid=')) {
+            return { url: urlMatch[1], source: 'meta' };
+          }
+        }
+
+        // Check inline scripts
+        const scripts = Array.from(document.querySelectorAll('script:not([src])'));
+        for (const script of scripts) {
+          const text = script.textContent || '';
+          const urlMatch = text.match(/available-swo\.php\?[^"'\s]+vid=[^"'\s]+/);
+          if (urlMatch) {
+            return { url: urlMatch[0], source: 'script' };
+          }
+        }
+
+        // Check window.location assignments in scripts
+        for (const script of scripts) {
+          const text = script.textContent || '';
+          if (text.includes('vid=') && text.includes('exp=')) {
+            const matches = text.match(/['"]([^'"]*vid=[^'"]*exp=[^'"]*)['"]/) ||
+                           text.match(/['"]([^'"]*\?[^'"]*vid=[^'"]*)['"]/) ||
+                           text.match(/location\s*=\s*['"]([^'"]+)['"]/);
+            if (matches && matches[1]) {
+              return { url: matches[1], source: 'script-location' };
+            }
+          }
+        }
+
         return null;
       });
-      if (tokenizedUrl) portalUrl = tokenizedUrl;
+
+      if (deepSearch) {
+        let url = deepSearch.url;
+        if (!url.startsWith('http')) {
+          url = new URL(url, 'https://relyhome.com').href;
+        }
+        console.log(`[Worker] Found token URL from ${deepSearch.source}: ${url}`);
+        portalUrl = url;
+      }
     }
 
+    // Final URL check
     console.log(`[Worker] Final portal URL: ${portalUrl}`);
 
     if (portalUrl && portalUrl.includes('login')) {
       throw new Error('Redirected back to login page');
     }
 
+    const hasTokens = portalUrl && portalUrl.includes('vid=') && portalUrl.includes('exp=');
+    
+    if (!hasTokens) {
+      console.log('[Worker] WARNING: Could not find session tokens. Using base URL.');
+      // Still return the base URL - the session might be cookie-based
+    }
+
     res.json({
       success: true,
       portal_url: portalUrl || 'https://relyhome.com/jobs/accept/available-swo.php',
-      has_tokens: portalUrl?.includes('vid=') && portalUrl?.includes('exp='),
+      has_tokens: hasTokens,
       refreshed_at: new Date().toISOString(),
     });
+
   } catch (error) {
     console.error(`[Worker] Login error:`, error.message);
     res.status(500).json({ success: false, error: error.message });
