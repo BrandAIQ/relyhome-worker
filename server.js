@@ -1,11 +1,29 @@
+/**
+ * RelyHome Puppeteer Automation Worker (FULL FIXED VERSION)
+ * - Adds robust login/session handling
+ * - Applies cookie cache for BOTH /scrape and /accept
+ * - Fixes session-expired heuristic (not overly aggressive)
+ * - Handles Node <18 fetch (optional)
+ * - Safer navigation/click patterns
+ */
+
 const express = require('express');
 const puppeteer = require('puppeteer');
+
+// Node 18+ has global fetch.
+// If you're on Node < 18, uncomment the next 2 lines:
+// const fetch = require('node-fetch');
+// global.fetch = fetch;
 
 const app = express();
 app.use(express.json({ limit: '50mb' }));
 
 const PORT = process.env.PORT || 3000;
 const WORKER_SECRET = process.env.AUTOMATION_WORKER_SECRET;
+
+// Optional: set these in your worker environment for /accept auto re-login
+const RELYHOME_USERNAME = process.env.RELYHOME_USERNAME;
+const RELYHOME_PASSWORD = process.env.RELYHOME_PASSWORD;
 
 // RelyHome session cookie cache (in-memory; persists within a single worker instance)
 let relyhomeCookies = null;
@@ -21,8 +39,11 @@ const RELYHOME_SESSION_EXPIRED_PATTERNS = [
 ];
 
 function looksLikeRelyhomeSessionExpired(text = '') {
-  const t = String(text || '').toLowerCase();
-  if (t.length < 100) return true;
+  const t = String(text || '').toLowerCase().trim();
+
+  // If nearly empty, it's suspicious, but not guaranteed.
+  if (t.length < 40) return true;
+
   return RELYHOME_SESSION_EXPIRED_PATTERNS.some((p) => t.includes(p));
 }
 
@@ -59,14 +80,23 @@ async function saveRelyhomeCookieCache(page) {
   }
 }
 
-// FIXED: More lenient login detection
+// FIXED: More lenient login detection (hardened)
 async function loginToRelyHome(page, username, password) {
   console.log('[Worker] Logging into RelyHome...');
 
   await page.goto('https://relyhome.com/login', { waitUntil: 'networkidle2', timeout: 30000 });
-  await page.waitForSelector('input[name="username"], input[name="email"], input[type="email"]', { timeout: 10000 });
+  await page.waitForSelector(
+    'input[name="username"], input[name="email"], input[type="email"], #username, #email',
+    { timeout: 15000 }
+  );
 
-  const usernameSelectors = ['input[name="username"]', 'input[name="email"]', 'input[type="email"]', '#username', '#email'];
+  const usernameSelectors = [
+    'input[name="username"]',
+    'input[name="email"]',
+    'input[type="email"]',
+    '#username',
+    '#email',
+  ];
   const passwordSelectors = ['input[name="password"]', 'input[type="password"]', '#password'];
 
   let usernameField = null;
@@ -99,7 +129,6 @@ async function loginToRelyHome(page, username, password) {
   await page.keyboard.press('Backspace');
   await passwordField.type(password, { delay: 50 });
 
-  // Click submit
   const didSubmit = await page.evaluate(() => {
     const btn = document.querySelector('button[type="submit"], input[type="submit"]');
     if (btn) {
@@ -117,18 +146,15 @@ async function loginToRelyHome(page, username, password) {
     return false;
   });
 
-  if (!didSubmit) {
-    await page.keyboard.press('Enter');
-  }
+  if (!didSubmit) await page.keyboard.press('Enter');
 
-  // Wait longer for navigation
+  // Wait for navigation or client-side transition
   await Promise.race([
-    page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 }),
-    page.waitForTimeout(10000),
+    page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 }).catch(() => {}),
+    page.waitForTimeout(12000),
   ]);
 
-  // Additional wait for client-side redirects
-  await page.waitForTimeout(2000);
+  await page.waitForTimeout(1500);
 
   const finalUrl = page.url();
   const pageText = await page.evaluate(() => document.body?.innerText || '');
@@ -137,7 +163,7 @@ async function loginToRelyHome(page, username, password) {
   console.log(`[Worker] Post-login URL: ${finalUrl}`);
   console.log(`[Worker] Page text length: ${pageText.length}`);
 
-  // Check for explicit error messages first
+  // Explicit error messages
   const hasLoginError =
     lowerText.includes('invalid password') ||
     lowerText.includes('invalid credentials') ||
@@ -152,21 +178,45 @@ async function loginToRelyHome(page, username, password) {
     throw new Error('Login failed: Invalid credentials');
   }
 
-  // Check if we're still on the login page with login form elements
-  const stillOnLoginPage =
-    finalUrl.includes('/login') &&
-    (lowerText.includes('sign in') ||
-      lowerText.includes('forgot password') ||
-      lowerText.includes('remember me') ||
-      lowerText.includes('don\'t have an account'));
+  // Best signal: login form still present
+  const loginInputsStillPresent = await page.$(
+    'input[type="password"], input[name="password"], #password'
+  );
+  const stillOnLoginUrl = finalUrl.includes('/login');
 
-  if (stillOnLoginPage) {
-    console.log('[Worker] Still appears to be on login page');
+  if (stillOnLoginUrl && loginInputsStillPresent) {
+    console.log('[Worker] Still on login page (password input still present)');
     throw new Error('Login appears to have failed - still on login page');
   }
 
-  // If we got here, login was successful
   console.log('[Worker] Login successful - navigated away from login page');
+}
+
+async function ensureRelyhomeSession(page, { username, password, contextLabel }) {
+  // Context label is just for logs
+  const label = contextLabel ? ` (${contextLabel})` : '';
+
+  // Apply cached cookies first
+  await applyRelyhomeCookieCache(page);
+
+  // If the current page already has content, check it.
+  // Otherwise caller can do a goto then call ensure again.
+  try {
+    const text = await page.evaluate(() => document.body?.innerText || '');
+    if (!looksLikeRelyhomeSessionExpired(text)) return;
+
+    if (!username || !password) {
+      throw new Error(
+        `Session appears expired${label} but no credentials provided (RELYHOME_USERNAME/RELYHOME_PASSWORD or request creds).`
+      );
+    }
+
+    console.log(`[Worker] Session appears expired${label}; attempting login...`);
+    await loginToRelyHome(page, username, password);
+    await saveRelyhomeCookieCache(page);
+  } catch (e) {
+    // If page isn't ready, ignore and let caller handle after navigation.
+  }
 }
 
 // Health check
@@ -183,13 +233,13 @@ app.post('/accept', async (req, res) => {
     preferred_slots,
     preferred_days,
     callback_url,
-    secret
+    secret,
   } = req.body;
 
   console.log(`[Worker] Received job ${job_id}, task ${task_id}`);
   console.log(`[Worker] Accept URL: ${accept_url}`);
-  console.log(`[Worker] Preferred slots: ${preferred_slots?.join(', ')}`);
-  console.log(`[Worker] Preferred days: ${preferred_days?.join(', ')}`);
+  console.log(`[Worker] Preferred slots: ${(preferred_slots || []).join(', ')}`);
+  console.log(`[Worker] Preferred days: ${(preferred_days || []).join(', ')}`);
 
   if (WORKER_SECRET && secret !== WORKER_SECRET) {
     console.error('[Worker] Invalid secret');
@@ -205,8 +255,8 @@ app.post('/accept', async (req, res) => {
     preferred_slots: preferred_slots || [],
     preferred_days: preferred_days || [],
     callback_url,
-    secret
-  });
+    secret,
+  }).catch((e) => console.error('[Worker] processJob top-level error:', e));
 });
 
 async function processJob({
@@ -216,7 +266,7 @@ async function processJob({
   preferred_slots,
   preferred_days,
   callback_url,
-  secret
+  secret,
 }) {
   let browser = null;
   let screenshotBase64 = null;
@@ -227,30 +277,50 @@ async function processJob({
 
     browser = await puppeteer.launch({
       headless: 'new',
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu'
-      ]
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
     });
 
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 800 });
 
+    // Apply cookies before first navigation
+    await applyRelyhomeCookieCache(page);
+
     console.log(`[Worker] Navigating to ${accept_url}`);
     await page.goto(accept_url, { waitUntil: 'networkidle2', timeout: 30000 });
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(1500);
+
+    // If this is actually a login/session expired page, re-login and retry
+    {
+      const firstText = await page.evaluate(() => document.body?.innerText || '');
+      if (looksLikeRelyhomeSessionExpired(firstText)) {
+        console.log('[Worker] Session looks expired on accept page; logging in and retrying...');
+
+        const u = RELYHOME_USERNAME;
+        const p = RELYHOME_PASSWORD;
+        if (!u || !p) {
+          throw new Error(
+            'Session expired on accept page and RELYHOME_USERNAME/RELYHOME_PASSWORD are not set on worker'
+          );
+        }
+
+        await loginToRelyHome(page, u, p);
+        await saveRelyhomeCookieCache(page);
+
+        await page.goto(accept_url, { waitUntil: 'networkidle2', timeout: 30000 });
+        await page.waitForTimeout(1500);
+      }
+    }
 
     availableSlots = await page.evaluate(() => {
       const slots = [];
       const radioButtons = document.querySelectorAll(
         'input[type="radio"][name="appttime"], ' +
-        'input[type="radio"][name="appointment"], ' +
-        'input[type="radio"][name="time_slot"]'
+          'input[type="radio"][name="appointment"], ' +
+          'input[type="radio"][name="time_slot"]'
       );
 
-      radioButtons.forEach(radio => {
+      radioButtons.forEach((radio) => {
         let labelText = '';
         if (radio.id) {
           const label = document.querySelector(`label[for="${radio.id}"]`);
@@ -266,7 +336,7 @@ async function processJob({
           value: radio.value,
           label: labelText,
           id: radio.id,
-          name: radio.name
+          name: radio.name,
         });
       });
 
@@ -274,7 +344,9 @@ async function processJob({
     });
 
     console.log(`[Worker] Found ${availableSlots.length} available slots`);
-    availableSlots.forEach((slot, i) => console.log(`  ${i + 1}. ${slot.label} (${slot.value})`));
+    availableSlots.forEach((slot, i) =>
+      console.log(`  ${i + 1}. ${slot.label} (${slot.value})`)
+    );
 
     if (availableSlots.length === 0) {
       throw new Error('No time slots found on page');
@@ -284,10 +356,14 @@ async function processJob({
     console.log(`[Worker] Selected slot: ${bestSlot.label} (${bestSlot.value})`);
 
     const radioSelector = bestSlot.id
-      ? `#${bestSlot.id}`
-      : `input[type="radio"][name="${bestSlot.name}"][value="${bestSlot.value}"]`;
+      ? `#${cssEscape(bestSlot.id)}`
+      : `input[type="radio"][name="${cssEscape(bestSlot.name)}"][value="${cssEscape(bestSlot.value)}"]`;
 
-    await page.click(radioSelector);
+    // Use click with fallback
+    await page.evaluate((sel) => {
+      const el = document.querySelector(sel);
+      if (el) el.click();
+    }, radioSelector);
     await page.waitForTimeout(500);
 
     const submitClicked = await page.evaluate(() => {
@@ -297,7 +373,7 @@ async function processJob({
         'button[type="submit"]',
         'input[type="submit"]',
         '.accept-button',
-        '#accept-btn'
+        '#accept-btn',
       ];
 
       for (const selector of submitSelectors) {
@@ -330,22 +406,28 @@ async function processJob({
 
     await Promise.race([
       page.waitForNavigation({ timeout: 15000 }).catch(() => {}),
-      page.waitForTimeout(5000)
+      page.waitForTimeout(5000),
     ]);
 
     screenshotBase64 = await page.screenshot({ encoding: 'base64' });
 
-    const pageText = await page.evaluate(() => document.body.innerText);
+    const pageText = await page.evaluate(() => document.body?.innerText || '');
 
+    const lower = pageText.toLowerCase();
     const isConfirmed =
-      pageText.toLowerCase().includes('confirmed') ||
-      pageText.toLowerCase().includes('accepted') ||
-      pageText.toLowerCase().includes('scheduled') ||
-      pageText.toLowerCase().includes('success') ||
-      pageText.toLowerCase().includes('thank you');
+      lower.includes('confirmed') ||
+      lower.includes('accepted') ||
+      lower.includes('scheduled') ||
+      lower.includes('success') ||
+      lower.includes('thank you');
 
     if (!isConfirmed) {
-      console.log(`[Worker] Warning: Could not confirm acceptance. Page text: ${pageText.slice(0, 200)}`);
+      console.log(
+        `[Worker] Warning: Could not confirm acceptance. Page text preview: ${pageText.slice(
+          0,
+          200
+        )}`
+      );
     }
 
     const { date, day, timeRange } = parseSlotLabel(bestSlot.label);
@@ -361,11 +443,10 @@ async function processJob({
       selected_day: day,
       confirmation_message: isConfirmed ? 'Job accepted successfully' : 'Submitted but confirmation unclear',
       screenshot_base64: screenshotBase64,
-      available_slots: availableSlots.map(s => s.label),
+      available_slots: availableSlots.map((s) => s.label),
       error: null,
-      secret
+      secret,
     });
-
   } catch (error) {
     console.error(`[Worker] Error processing job ${job_id}:`, error.message);
 
@@ -387,11 +468,10 @@ async function processJob({
       selected_day: null,
       confirmation_message: null,
       screenshot_base64: screenshotBase64,
-      available_slots: availableSlots.map(s => s.label),
+      available_slots: availableSlots.map((s) => s.label),
       error: error.message,
-      secret
+      secret,
     });
-
   } finally {
     if (browser) {
       await browser.close();
@@ -400,12 +480,12 @@ async function processJob({
 }
 
 function findBestSlot(availableSlots, preferredDays, preferredSlots) {
-  const normDays = (preferredDays || []).map(d => d.toLowerCase());
-  const normSlots = (preferredSlots || []).map(s => s.toLowerCase());
+  const normDays = (preferredDays || []).map((d) => String(d).toLowerCase());
+  const normSlots = (preferredSlots || []).map((s) => String(s).toLowerCase());
 
-  const scoredSlots = availableSlots.map(slot => {
+  const scoredSlots = availableSlots.map((slot) => {
     let score = 0;
-    const labelLower = slot.label.toLowerCase();
+    const labelLower = String(slot.label || '').toLowerCase();
 
     for (const day of normDays) {
       if (labelLower.includes(day) || labelLower.includes(getDayFull(day))) {
@@ -431,8 +511,13 @@ function findBestSlot(availableSlots, preferredDays, preferredSlots) {
 
 function getDayFull(abbrev) {
   const days = {
-    'sun': 'sunday', 'mon': 'monday', 'tue': 'tuesday', 'wed': 'wednesday',
-    'thu': 'thursday', 'fri': 'friday', 'sat': 'saturday'
+    sun: 'sunday',
+    mon: 'monday',
+    tue: 'tuesday',
+    wed: 'wednesday',
+    thu: 'thursday',
+    fri: 'friday',
+    sat: 'saturday',
   };
   return days[abbrev] || abbrev;
 }
@@ -444,7 +529,7 @@ function timeRangeMatches(label, prefSlot) {
 
   if (labelTimes.length === 0 || prefTimes.length === 0) return false;
 
-  return labelTimes.some(lt => prefTimes.some(pt => lt === pt));
+  return labelTimes.some((lt) => prefTimes.some((pt) => lt === pt));
 }
 
 function parseSlotLabel(label) {
@@ -458,7 +543,9 @@ function parseSlotLabel(label) {
   const dayMatch = label.match(/(monday|tuesday|wednesday|thursday|friday|saturday|sunday)/i);
   if (dayMatch) day = dayMatch[1];
 
-  const timeMatch = label.match(/(\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*-\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)?)/i);
+  const timeMatch = label.match(
+    /(\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*-\s*\d{1,2}(?::\d{2})?\s*(?:am|pm)?)/i
+  );
   if (timeMatch) timeRange = timeMatch[1];
 
   return { date, day, timeRange };
@@ -470,7 +557,7 @@ async function sendCallback(callbackUrl, data) {
     const response = await fetch(callbackUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data)
+      body: JSON.stringify(data),
     });
     console.log(`[Worker] Callback response: ${response.status}`);
   } catch (error) {
@@ -496,12 +583,7 @@ app.post('/scrape', async (req, res) => {
   try {
     browser = await puppeteer.launch({
       headless: 'new',
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu'
-      ]
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
     });
 
     const page = await browser.newPage();
@@ -514,37 +596,34 @@ app.post('/scrape', async (req, res) => {
     await page.waitForTimeout(2000);
 
     let { markdown, jobLinks } = await page.evaluate(() => {
-      const text = document.body.innerText;
+      const text = document.body.innerText || '';
       const links = [];
 
-      const acceptLinks = document.querySelectorAll('a[href*="/jobs/accept/offer.php"], a[href*="offer.php"]');
+      const acceptLinks = document.querySelectorAll(
+        'a[href*="/jobs/accept/offer.php"], a[href*="offer.php"]'
+      );
 
       acceptLinks.forEach((link, index) => {
         const row = link.closest('tr');
-        let rowText = '';
-        if (row) {
-          rowText = row.innerText;
-        }
-
         links.push({
           href: link.href,
-          text: link.innerText || link.textContent,
-          rowText: rowText,
-          index: index
+          text: link.innerText || link.textContent || '',
+          rowText: row ? row.innerText : '',
+          index,
         });
       });
 
       if (links.length === 0) {
         document.querySelectorAll('a').forEach((link, index) => {
           const href = link.href || '';
-          const text = (link.innerText || '').toLowerCase();
-          if (text.includes('accept') && href.includes('relyhome')) {
+          const textLower = (link.innerText || '').toLowerCase();
+          if (textLower.includes('accept') && href.includes('relyhome')) {
             const row = link.closest('tr');
             links.push({
               href: link.href,
-              text: link.innerText,
+              text: link.innerText || '',
               rowText: row ? row.innerText : '',
-              index: index
+              index,
             });
           }
         });
@@ -555,43 +634,54 @@ app.post('/scrape', async (req, res) => {
 
     let html = await page.content();
 
-    if (looksLikeRelyhomeSessionExpired(markdown) && username && password) {
+    if (looksLikeRelyhomeSessionExpired(markdown)) {
       console.log('[Worker] Session appears expired during scrape; attempting login + retry...');
-      await loginToRelyHome(page, username, password);
+
+      const u = username || RELYHOME_USERNAME;
+      const p = password || RELYHOME_PASSWORD;
+
+      if (!u || !p) {
+        throw new Error('Session expired and no credentials provided for scrape');
+      }
+
+      await loginToRelyHome(page, u, p);
       await saveRelyhomeCookieCache(page);
+
       await page.goto(url, { waitUntil: 'networkidle2', timeout: 20000 });
       await page.waitForTimeout(2000);
 
       ({ markdown, jobLinks } = await page.evaluate(() => {
-        const text = document.body.innerText;
+        const text = document.body.innerText || '';
         const links = [];
-        const acceptLinks = document.querySelectorAll('a[href*="/jobs/accept/offer.php"], a[href*="offer.php"]');
+        const acceptLinks = document.querySelectorAll(
+          'a[href*="/jobs/accept/offer.php"], a[href*="offer.php"]'
+        );
         acceptLinks.forEach((link, index) => {
           const row = link.closest('tr');
-          let rowText = '';
-          if (row) rowText = row.innerText;
           links.push({
             href: link.href,
-            text: link.innerText || link.textContent,
-            rowText,
+            text: link.innerText || link.textContent || '',
+            rowText: row ? row.innerText : '',
             index,
           });
         });
+
         if (links.length === 0) {
           document.querySelectorAll('a').forEach((link, index) => {
             const href = link.href || '';
-            const text = (link.innerText || '').toLowerCase();
-            if (text.includes('accept') && href.includes('relyhome')) {
+            const textLower = (link.innerText || '').toLowerCase();
+            if (textLower.includes('accept') && href.includes('relyhome')) {
               const row = link.closest('tr');
               links.push({
                 href: link.href,
-                text: link.innerText,
+                text: link.innerText || '',
                 rowText: row ? row.innerText : '',
                 index,
               });
             }
           });
         }
+
         return { markdown: text, jobLinks: links };
       }));
 
@@ -600,16 +690,15 @@ app.post('/scrape', async (req, res) => {
 
     console.log(`[Worker] Scraped ${markdown.length} chars of text`);
     console.log(`[Worker] Found ${jobLinks.length} accept links`);
-    jobLinks.forEach((l, i) => console.log(`  ${i + 1}. ${l.href.substring(0, 80)}...`));
+    jobLinks.forEach((l, i) => console.log(`  ${i + 1}. ${String(l.href).substring(0, 80)}...`));
 
     res.json({
       success: true,
       raw_markdown: markdown,
       raw_html: html,
       job_links: jobLinks,
-      scraped_at: new Date().toISOString()
+      scraped_at: new Date().toISOString(),
     });
-
   } catch (error) {
     console.error(`[Worker] Scrape error:`, error.message);
     res.status(500).json({ success: false, error: error.message });
@@ -638,12 +727,7 @@ app.post('/login', async (req, res) => {
   try {
     browser = await puppeteer.launch({
       headless: 'new',
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu'
-      ]
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
     });
 
     const page = await browser.newPage();
@@ -651,10 +735,9 @@ app.post('/login', async (req, res) => {
 
     console.log(`[Worker] Logging in to RelyHome...`);
     await loginToRelyHome(page, username, password);
-
     await saveRelyhomeCookieCache(page);
 
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(2000);
     console.log(`[Worker] Post-login URL: ${page.url()}`);
 
     console.log(`[Worker] Looking for Available Jobs navigation link...`);
@@ -666,8 +749,11 @@ app.post('/login', async (req, res) => {
         const href = link.getAttribute('href') || '';
         const text = (link.textContent || '').toLowerCase();
 
-        if ((href.includes('available-swo') || href.includes('available') || text.includes('available'))
-            && href.includes('vid=') && href.includes('exp=')) {
+        if (
+          (href.includes('available-swo') || href.includes('available') || text.includes('available')) &&
+          href.includes('vid=') &&
+          href.includes('exp=')
+        ) {
           const fullUrl = new URL(href, window.location.origin).href;
           return { found: true, url: fullUrl, method: 'tokenized_link' };
         }
@@ -705,11 +791,11 @@ app.post('/login', async (req, res) => {
     } else if (navResult.clicked) {
       console.log(`[Worker] Clicked navigation, waiting for page load...`);
       await Promise.race([
-        page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }),
-        page.waitForTimeout(5000)
+        page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {}),
+        page.waitForTimeout(6000),
       ]);
 
-      await page.waitForTimeout(2000);
+      await page.waitForTimeout(1500);
       portalUrl = page.url();
       console.log(`[Worker] URL after navigation: ${portalUrl}`);
     }
@@ -719,10 +805,10 @@ app.post('/login', async (req, res) => {
 
       await page.goto('https://relyhome.com/jobs/accept/available-swo.php', {
         waitUntil: 'networkidle2',
-        timeout: 20000
+        timeout: 20000,
       });
 
-      await page.waitForTimeout(3000);
+      await page.waitForTimeout(2000);
       portalUrl = page.url();
       console.log(`[Worker] URL after direct navigation: ${portalUrl}`);
     }
@@ -789,16 +875,17 @@ app.post('/login', async (req, res) => {
     }
 
     if (!portalUrl || (!portalUrl.includes('vid=') && !portalUrl.includes('exp='))) {
-      console.log(`[Worker] Warning: Could not find session tokens in URL. Session may be cookie-based.`);
+      console.log(
+        `[Worker] Warning: Could not find session tokens in URL. Session may be cookie-based.`
+      );
     }
 
     res.json({
       success: true,
       portal_url: portalUrl || 'https://relyhome.com/jobs/accept/available-swo.php',
       has_tokens: portalUrl?.includes('vid=') && portalUrl?.includes('exp='),
-      refreshed_at: new Date().toISOString()
+      refreshed_at: new Date().toISOString(),
     });
-
   } catch (error) {
     console.error(`[Worker] Login error:`, error.message);
     res.status(500).json({ success: false, error: error.message });
@@ -812,3 +899,15 @@ app.post('/login', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`[Worker] Puppeteer automation worker running on port ${PORT}`);
 });
+
+// ---------- helpers ----------
+
+function cssEscape(value) {
+  // minimal safe escape for IDs/attrs used in querySelector strings
+  return String(value || '')
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/'/g, "\\'")
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r');
+}
