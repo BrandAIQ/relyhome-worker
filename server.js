@@ -686,227 +686,173 @@ app.post('/login', async (req, res) => {
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 800 });
 
-    // Navigate to RelyHome login page
-    console.log(`[Worker] Navigating to RelyHome login page...`);
-    await page.goto('https://relyhome.com/login', { waitUntil: 'networkidle2', timeout: 30000 });
+    // Step 1: Login to RelyHome
+    console.log(`[Worker] Logging in to RelyHome...`);
+    await loginToRelyHome(page, username, password);
+    
+    // Save cookies for future scrapes
+    await saveRelyhomeCookieCache(page);
 
-    // Wait for login form
-    await page.waitForSelector('input[name="username"], input[name="email"], input[type="email"]', { timeout: 10000 });
+    // Step 2: Wait for dashboard to load after login
+    await page.waitForTimeout(3000);
+    console.log(`[Worker] Post-login URL: ${page.url()}`);
 
-    // Fill in credentials - try different field names
-    const usernameSelectors = ['input[name="username"]', 'input[name="email"]', 'input[type="email"]', '#username', '#email'];
-    const passwordSelectors = ['input[name="password"]', 'input[type="password"]', '#password'];
-
-    let usernameField = null;
-    let passwordField = null;
-
-    for (const selector of usernameSelectors) {
-      try {
-        usernameField = await page.$(selector);
-        if (usernameField) break;
-      } catch (e) {}
-    }
-
-    for (const selector of passwordSelectors) {
-      try {
-        passwordField = await page.$(selector);
-        if (passwordField) break;
-      } catch (e) {}
-    }
-
-    if (!usernameField || !passwordField) {
-      throw new Error('Could not find login form fields');
-    }
-
-    console.log(`[Worker] Entering credentials...`);
-    await usernameField.type(username, { delay: 50 });
-    await passwordField.type(password, { delay: 50 });
-
-    // Click login button
-    const loginClicked = await page.evaluate(() => {
-      const selectors = [
-        'button[type="submit"]',
-        'input[type="submit"]',
-        'button:contains("Login")',
-        'button:contains("Sign In")',
-        '.login-button',
-        '#login-btn'
-      ];
-
-      for (const selector of selectors) {
-        try {
-          const btn = document.querySelector(selector);
-          if (btn) {
-            btn.click();
-            return true;
-          }
-        } catch (e) {}
-      }
-
-      // Fallback: find any button with login-related text
-      const allButtons = [...document.querySelectorAll('button, input[type="submit"]')];
-      for (const btn of allButtons) {
-        const text = (btn.value || btn.textContent || '').toLowerCase();
-        if (text.includes('login') || text.includes('sign in') || text.includes('submit')) {
-          btn.click();
-          return true;
-        }
-      }
-
-      return false;
-    });
-
-    if (!loginClicked) {
-      throw new Error('Could not find login button');
-    }
-
-    console.log(`[Worker] Login submitted, waiting for redirect...`);
-
-    // Wait for navigation after login
-    await Promise.race([
-      page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }),
-      page.waitForTimeout(8000)
-    ]);
-
-    // Check if login was successful by looking for dashboard/jobs elements
-    const currentUrl = page.url();
-    console.log(`[Worker] Current URL after login: ${currentUrl}`);
-
-    // Check for login error messages
-    const hasError = await page.evaluate(() => {
-      const errorSelectors = ['.error', '.alert-danger', '.login-error', '[class*="error"]'];
-      for (const selector of errorSelectors) {
-        const el = document.querySelector(selector);
-        if (el && el.innerText.toLowerCase().includes('invalid')) {
-          return el.innerText;
-        }
-      }
-      return null;
-    });
-
-    if (hasError) {
-      throw new Error(`Login failed: ${hasError}`);
-    }
-
-// After successful login, find the jobs page through navigation
-console.log(`[Worker] Looking for Available Jobs link in navigation...`);
-
-// First, try to find and click a navigation link to the jobs page
-const navClicked = await page.evaluate(() => {
-  // Look for menu/nav links that lead to available jobs
-  const linkSelectors = [
-    'a[href*="available-swo"]',
-    'a[href*="available"]',
-    'a:contains("Available")',
-    'a:contains("Jobs")'
-  ];
-  
-  for (const selector of linkSelectors) {
-    try {
-      const links = document.querySelectorAll(selector);
-      for (const link of links) {
+    // Step 3: Try to find and click a navigation link to Available Jobs
+    console.log(`[Worker] Looking for Available Jobs navigation link...`);
+    
+    const navResult = await page.evaluate(() => {
+      // Look for menu/nav links that lead to available jobs
+      const allLinks = Array.from(document.querySelectorAll('a'));
+      
+      for (const link of allLinks) {
         const href = link.getAttribute('href') || '';
-        const text = link.textContent || '';
-        if (href.includes('available') || text.toLowerCase().includes('available')) {
-          link.click();
-          return { clicked: true, href };
+        const text = (link.textContent || '').toLowerCase();
+        
+        // Check if this link leads to available jobs AND has session tokens
+        if ((href.includes('available-swo') || href.includes('available') || text.includes('available')) 
+            && href.includes('vid=') && href.includes('exp=')) {
+          // Found a tokenized link - return it directly
+          const fullUrl = new URL(href, window.location.origin).href;
+          return { found: true, url: fullUrl, method: 'tokenized_link' };
         }
       }
-    } catch (e) {}
-  }
-  return { clicked: false };
-});
+      
+      // Look for any link to available jobs (even without tokens)
+      for (const link of allLinks) {
+        const href = link.getAttribute('href') || '';
+        const text = (link.textContent || '').toLowerCase();
+        
+        if (href.includes('available-swo') || (text.includes('available') && text.includes('job'))) {
+          link.click();
+          return { found: true, clicked: true, href, method: 'clicked_link' };
+        }
+      }
+      
+      // Look for menu items
+      const menuItems = Array.from(document.querySelectorAll('[class*="menu"] a, [class*="nav"] a, .sidebar a'));
+      for (const item of menuItems) {
+        const text = (item.textContent || '').toLowerCase();
+        if (text.includes('available') || text.includes('accept')) {
+          item.click();
+          return { found: true, clicked: true, text, method: 'menu_click' };
+        }
+      }
+      
+      return { found: false };
+    });
 
-if (navClicked.clicked) {
-  console.log(`[Worker] Clicked nav link: ${navClicked.href}`);
-  await Promise.race([
-    page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }),
-    page.waitForTimeout(5000)
-  ]);
-}
+    console.log(`[Worker] Nav result:`, JSON.stringify(navResult));
 
-// Wait for dynamic content
-await page.waitForTimeout(3000);
+    let portalUrl = null;
 
-// Get the current URL - may now have tokens
-let portalUrl = page.url();
-console.log(`[Worker] Current URL: ${portalUrl}`);
+    if (navResult.found && navResult.url) {
+      // We found a tokenized URL directly
+      portalUrl = navResult.url;
+      console.log(`[Worker] Found tokenized URL directly: ${portalUrl}`);
+    } else if (navResult.clicked) {
+      // We clicked a link, wait for navigation
+      console.log(`[Worker] Clicked navigation, waiting for page load...`);
+      await Promise.race([
+        page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }),
+        page.waitForTimeout(5000)
+      ]);
+      
+      await page.waitForTimeout(2000);
+      portalUrl = page.url();
+      console.log(`[Worker] URL after navigation: ${portalUrl}`);
+    }
 
-// If still no tokens, do a comprehensive search
-if (!portalUrl.includes('vid=') || !portalUrl.includes('exp=')) {
-  console.log(`[Worker] Searching page for tokenized URLs...`);
-  
-  const tokenizedUrl = await page.evaluate(() => {
-    // Check all links for tokens
-    const allLinks = Array.from(document.querySelectorAll('a'));
-    for (const link of allLinks) {
-      const href = link.getAttribute('href') || '';
-      if (href.includes('vid=') && href.includes('exp=')) {
-        return new URL(href, window.location.origin).href;
+    // Step 4: If still no tokenized URL, navigate directly and search
+    if (!portalUrl || !portalUrl.includes('vid=') || !portalUrl.includes('exp=')) {
+      console.log(`[Worker] Trying direct navigation to available-swo.php...`);
+      
+      await page.goto('https://relyhome.com/jobs/accept/available-swo.php', { 
+        waitUntil: 'networkidle2', 
+        timeout: 20000 
+      });
+      
+      await page.waitForTimeout(3000);
+      portalUrl = page.url();
+      console.log(`[Worker] URL after direct navigation: ${portalUrl}`);
+    }
+
+    // Step 5: Comprehensive search for tokenized URLs
+    if (!portalUrl.includes('vid=') || !portalUrl.includes('exp=')) {
+      console.log(`[Worker] Searching page comprehensively for tokenized URLs...`);
+      
+      const tokenizedUrl = await page.evaluate(() => {
+        // Check all links
+        const allLinks = Array.from(document.querySelectorAll('a'));
+        for (const link of allLinks) {
+          const href = link.getAttribute('href') || '';
+          if (href.includes('vid=') && href.includes('exp=')) {
+            return { url: new URL(href, window.location.origin).href, source: 'link' };
+          }
+        }
+        
+        // Check form actions
+        const forms = Array.from(document.querySelectorAll('form'));
+        for (const form of forms) {
+          const action = form.getAttribute('action') || '';
+          if (action.includes('vid=') && action.includes('exp=')) {
+            return { url: new URL(action, window.location.origin).href, source: 'form' };
+          }
+        }
+        
+        // Check iframes
+        const iframes = Array.from(document.querySelectorAll('iframe'));
+        for (const iframe of iframes) {
+          const src = iframe.getAttribute('src') || '';
+          if (src.includes('vid=') && src.includes('exp=')) {
+            return { url: new URL(src, window.location.origin).href, source: 'iframe' };
+          }
+        }
+        
+        // Check meta refresh
+        const metaRefresh = document.querySelector('meta[http-equiv="refresh"]');
+        if (metaRefresh) {
+          const content = metaRefresh.getAttribute('content') || '';
+          const urlMatch = content.match(/url=([^;]+)/i);
+          if (urlMatch && urlMatch[1].includes('vid=')) {
+            return { url: new URL(urlMatch[1], window.location.origin).href, source: 'meta' };
+          }
+        }
+        
+        // Check inline scripts for URLs
+        const scripts = Array.from(document.querySelectorAll('script:not([src])'));
+        for (const script of scripts) {
+          const text = script.textContent || '';
+          const urlMatch = text.match(/available-swo\.php\?[^"'\s]+vid=[^"'\s]+exp=[^"'\s]+/);
+          if (urlMatch) {
+            return { url: new URL(urlMatch[0], window.location.origin).href, source: 'script' };
+          }
+        }
+        
+        return null;
+      });
+      
+      if (tokenizedUrl) {
+        console.log(`[Worker] Found tokenized URL from ${tokenizedUrl.source}: ${tokenizedUrl.url}`);
+        portalUrl = tokenizedUrl.url;
       }
     }
-    
-    // Check form actions
-    const forms = Array.from(document.querySelectorAll('form'));
-    for (const form of forms) {
-      const action = form.getAttribute('action') || '';
-      if (action.includes('vid=') && action.includes('exp=')) {
-        return new URL(action, window.location.origin).href;
-      }
-    }
-    
-    // Check iframes
-    const iframes = Array.from(document.querySelectorAll('iframe'));
-    for (const iframe of iframes) {
-      const src = iframe.getAttribute('src') || '';
-      if (src.includes('vid=') && src.includes('exp=')) {
-        return new URL(src, window.location.origin).href;
-      }
-    }
-    
-    // Check meta refresh
-    const metaRefresh = document.querySelector('meta[http-equiv="refresh"]');
-    if (metaRefresh) {
-      const content = metaRefresh.getAttribute('content') || '';
-      const urlMatch = content.match(/url=([^;]+)/i);
-      if (urlMatch && urlMatch[1].includes('vid=')) {
-        return new URL(urlMatch[1], window.location.origin).href;
-      }
-    }
-    
-    return null;
-  });
-  
-  if (tokenizedUrl) {
-    portalUrl = tokenizedUrl;
-    console.log(`[Worker] Found tokenized URL: ${portalUrl}`);
-  }
-}
 
-// Final fallback: navigate to the page and extract URL from response
-if (!portalUrl.includes('vid=') || !portalUrl.includes('exp=')) {
-  console.log(`[Worker] Trying direct navigation with response interception...`);
-  
-  // Save cookies for session
-  await saveRelyhomeCookieCache(page);
-  
-  // The session is cookie-based - return what we have
-  // but include a flag that tokens weren't found
-  console.log(`[Worker] Warning: Session appears cookie-based, tokens not in URL`);
-}
-
-    }
+    // Step 6: Final validation
+    console.log(`[Worker] Final portal URL: ${portalUrl}`);
     
-    console.log(`[Worker] Fresh portal URL: ${portalUrl}`);
-
-    // Verify we're on the right page (not redirected to login)
-    if (portalUrl.includes('login') || portalUrl.includes('signin')) {
+    if (portalUrl && portalUrl.includes('login')) {
       throw new Error('Login appears to have failed - redirected back to login page');
+    }
+
+    if (!portalUrl || (!portalUrl.includes('vid=') && !portalUrl.includes('exp='))) {
+      console.log(`[Worker] Warning: Could not find session tokens in URL. Session may be cookie-based.`);
+      // Still return the URL - the cookies we saved should work for scraping
     }
 
     res.json({
       success: true,
-      portal_url: portalUrl,
+      portal_url: portalUrl || 'https://relyhome.com/jobs/accept/available-swo.php',
+      has_tokens: portalUrl?.includes('vid=') && portalUrl?.includes('exp='),
       refreshed_at: new Date().toISOString()
     });
 
@@ -923,4 +869,3 @@ if (!portalUrl.includes('vid=') || !portalUrl.includes('exp=')) {
 app.listen(PORT, () => {
   console.log(`[Worker] Puppeteer automation worker running on port ${PORT}`);
 });
-
